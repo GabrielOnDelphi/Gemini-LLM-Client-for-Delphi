@@ -23,6 +23,7 @@ TYPE
   TAIResponse = class
    private
      FHttpStatus: Integer;
+     FRawBody: string;             // Raw response body on a non-200; the retry wrapper parses Gemini's RetryInfo.retryDelay out of it
      FSafetyRatings: TJSONArray;   // Raw JSON array for safety ratings
      FExtractedJSONObj: TJSONObject;
    public
@@ -46,10 +47,14 @@ TYPE
     function  detectErrorType(Response: string): string;
     procedure uploadFile(InputPart: TChatPart);
 
+    function  executeHttpRequest(BodyJSON: TJSONObject): TAIResponse;     // One HTTP attempt (the former body of postHttpRequest)
+    function  statusIsRetryable(StatusCode: Integer): Boolean;           // TRUE for <=0 / 408 / 429 / 5xx; FALSE for 4xx auth/bad-request
+    function  retryDelayFromBody(const ResponseBody: string): Integer;   // Gemini RetryInfo.retryDelay (ms) from the 429 JSON body; -1 if absent/unparsable
+
     procedure Load(Stream: TLightStream);   overload;
     procedure Save(Stream: TLightStream);   overload;
   protected
-    function postHttpRequest(BodyJSON: TJSONObject): TAIResponse; // Optional: Max tokens in response
+    function postHttpRequest(BodyJSON: TJSONObject): TAIResponse; // Retry wrapper around executeHttpRequest
     function makeGenerationConfig(const FilePath: String): TJSONPair;
   public
     LLM: TLLMObject;
@@ -57,6 +62,11 @@ TYPE
     TokensInput : Integer;   // Total input (prompt) tokens for ALL prompts
     TokensOutput: Integer;   // Total output (candidate) tokens for ALL prompts
     Timeout: Integer;        // HTTP timeout in milliseconds (connection and response)
+
+    { # Retry (in-memory only — NOT serialized; AiClient.bin format unchanged) }
+    MaxRetries      : Integer;   // Extra attempts after the first on a transient failure. 0 = retry disabled (old behavior)
+    RetryBaseDelayMs: Integer;   // First backoff delay; doubles each attempt (RetryBaseDelayMs * 2^attempt)
+    RetryMaxDelayMs : Integer;   // Cap for any single wait, incl. a Gemini retryDelay longer than this (longer => daily quota => give up)
 
     constructor Create; virtual;
     destructor  Destroy; override;
@@ -101,6 +111,9 @@ begin
   inherited Create;
   LLM:= TLLMGemini.Create;  //ToDo 6: Let the user choose the LLM.
   Timeout:= 300000;         // Default: 300 seconds (5 min) to match Gemini server-side limit
+  MaxRetries      := 3;
+  RetryBaseDelayMs:= 1000;
+  RetryMaxDelayMs := 60000;
   Load(AppDataCore.AppDataFolder+ 'AiClient.bin');
 end;
 
@@ -282,8 +295,58 @@ begin
 end;
 
 
-// Primary function to send chat history and parameters to the Gemini generateContent API
-function TAiClient.postHttpRequest(BodyJSON: TJSONObject): TAIResponse;
+{ TRUE for failures a retry might fix: network/connect error (StatusCode 0 — the POST raised before any response), request timeout (408), rate limit (429), and any 5xx. FALSE for 4xx auth / bad-request (e.g. 400/401/403) — a config or prompt error a retry would not fix. Mirrors PasClaw's IsRetryableStatus. }
+function TAiClient.statusIsRetryable(StatusCode: Integer): Boolean;
+begin
+  Result:= (StatusCode <= 0)
+        OR (StatusCode = 408)
+        OR (StatusCode = 429)
+        OR ((StatusCode >= 500) AND (StatusCode < 600));
+end;
+
+
+(* Reads Gemini's RetryInfo.retryDelay out of a 429 error body and returns it in milliseconds; -1 when absent or unparsable. The body shape is { "error": { "details": [ { "@type": ".../google.rpc.RetryInfo", "retryDelay": "42s" }, ... ] } } (https://cloud.google.com/blog/products/ai-machine-learning/learn-how-to-handle-429-resource-exhaustion-errors-in-your-llms). A short delay means a transient per-minute limit; a long delay (longer than the caller's cap) means a long-term/daily lockout. RetryInfo is NOT always present — a 429 can omit it and still be a per-minute limit — so a -1 result tells the caller "no hint", not "daily quota"; the caller falls back to its own backoff in that case. *)
+function TAiClient.retryDelayFromBody(const ResponseBody: string): Integer;
+VAR
+  Root, ErrObj, DetailObj: TJSONObject;
+  Details: TJSONArray;
+  RootVal, DetailVal: TJSONValue;
+  TypeStr, DelayStr: string;
+  Seconds: Double;
+begin
+  Result:= -1;
+  if Trim(ResponseBody) = '' then EXIT;
+
+  RootVal:= TJSONObject.ParseJSONValue(ResponseBody);
+  if RootVal = NIL then EXIT;
+  try
+    if NOT (RootVal is TJSONObject) then EXIT;
+    Root:= RootVal as TJSONObject;
+    if NOT Root.TryGetValue<TJSONObject>('error', ErrObj) then EXIT;
+    if NOT ErrObj.TryGetValue<TJSONArray>('details', Details) then EXIT;
+
+    for DetailVal in Details do
+     begin
+      if NOT (DetailVal is TJSONObject) then Continue;
+      DetailObj:= DetailVal as TJSONObject;
+      TypeStr:= DetailObj.GetValue<string>('@type', '');
+      if NOT ContainsText(TypeStr, 'RetryInfo') then Continue;
+
+      DelayStr:= Trim(DetailObj.GetValue<string>('retryDelay', ''));   // e.g. "42s" or "1.5s"
+      if EndsText('s', DelayStr) then SetLength(DelayStr, Length(DelayStr)-1);
+      if TryStrToFloat(DelayStr, Seconds, TFormatSettings.Invariant) AND (Seconds >= 0)
+      then Result:= Round(Seconds * 1000);
+      EXIT;   // RetryInfo found — done whether or not the value parsed
+     end;
+  finally
+    FreeAndNil(RootVal);
+  end;
+end;
+
+
+// One HTTP attempt against the Gemini generateContent API. The retry wrapper (postHttpRequest) calls this.
+// On a transient failure it sets Result.FHttpStatus (0 when the POST raised before a response arrived) and Result.ErrorMsg; the wrapper inspects both.
+function TAiClient.executeHttpRequest(BodyJSON: TJSONObject): TAIResponse;
 VAR
   FinishReason: string;
   ExtractedText: string;
@@ -352,6 +415,7 @@ begin
 
     if HttpResponse.StatusCode <> 200 then
       begin
+        Result.FRawBody := HttpResponse.ContentAsString;   // kept raw for the retry wrapper's RetryInfo parse
         Result.ErrorMsg:= 'AI response status: '+IntToStr(HttpResponse.StatusCode)+' ('+getHttpErrorMessage(HttpResponse.StatusCode)+') - ' + detectErrorType(HttpResponse.ContentAsString)+ '. ' + HttpResponse.ContentAsString;
         Result.ErrorMsg:= StringReplace(Result.ErrorMsg, '\n', sLineBreak, [rfReplaceAll]);
         Exit;
@@ -443,7 +507,52 @@ begin
     FreeAndNil(Request);
     FreeAndNil(HttpClient);
   end
-end;  
+end;
+
+
+// Sends the request, retrying transient failures (network / 408 / 429 / 5xx) with exponential backoff.
+// 4xx auth/bad-request errors are returned immediately — a retry would not fix them.
+// On HTTP 429 the wait comes from Gemini's RetryInfo.retryDelay when present and within RetryMaxDelayMs; a retryDelay longer than RetryMaxDelayMs signals a long-term/daily lockout and is NOT retried. A 429 with no RetryInfo falls back to exponential backoff (RetryInfo is optional and its absence does not by itself mean daily exhaustion).
+// MaxRetries = 0 reproduces the old single-attempt behavior.
+function TAiClient.postHttpRequest(BodyJSON: TJSONObject): TAIResponse;
+VAR
+  Attempt, DelayMs, BodyDelay: Integer;
+begin
+  Attempt:= 0;
+  while True do
+   begin
+    Result:= executeHttpRequest(BodyJSON);
+
+    { # Success or last attempt }
+    if (Result.ErrorMsg = '') OR (Attempt >= MaxRetries) then EXIT;
+
+    { # Non-retryable status — give up immediately }
+    if NOT statusIsRetryable(Result.FHttpStatus) then EXIT;
+
+    { # Decide the wait }
+    if Result.FHttpStatus = 429 then
+      begin
+        BodyDelay:= retryDelayFromBody(Result.FRawBody);
+        // A within-cap RetryInfo is a transient per-minute limit — honor the hint.
+        // A hint longer than the cap signals a long-term/daily lockout — give up (a retry would just hit it again).
+        // No usable RetryInfo (BodyDelay < 0): the daily-vs-transient signal lives in QuotaFailure.quotaId, not in RetryInfo's presence, and a 429 can lack RetryInfo yet still be a per-minute limit — so fall back to exponential backoff rather than assuming daily exhaustion.
+        if BodyDelay > RetryMaxDelayMs then EXIT;
+        if BodyDelay >= 0
+        then DelayMs:= BodyDelay                      // honor Gemini's hint
+        else DelayMs:= RetryBaseDelayMs shl Attempt;  // no RetryInfo: exponential backoff
+      end
+    else
+      DelayMs:= RetryBaseDelayMs shl Attempt;        // network / 408 / 5xx: exponential backoff
+
+    if DelayMs < 0 then DelayMs:= RetryMaxDelayMs;   // 'shl' overflowed Integer on an absurd MaxRetries: treat as the cap, not a 0 ms busy-spin
+    if DelayMs > RetryMaxDelayMs then DelayMs:= RetryMaxDelayMs;
+
+    AppDataCore.RamLog.AddWarn('LLM request failed (status '+IntToStr(Result.FHttpStatus)+'), retry '+IntToStr(Attempt+1)+'/'+IntToStr(MaxRetries)+' in '+IntToStr(DelayMs)+' ms');
+    FreeAndNil(Result);                              // discard the failed attempt before the next one
+    TThread.Sleep(DelayMs);
+    Inc(Attempt);
+   end;
+end;
 
 
 
@@ -585,9 +694,12 @@ var
   ContentObject: TJSONObject;
   PartsArray: TJSONArray;
   TextPart: TJSONObject;
+  SavedMaxRetries: Integer;
 begin
   BodyJSON:= nil;
   Result:= nil;
+  SavedMaxRetries:= MaxRetries;
+  MaxRetries:= 0;   // A connection test wants a fast single-shot answer; restored in the FINALLY so normal SendAPICall keeps its retries. Runs on the UI thread, so retry-backoff sleeps would freeze the dialog.
   try
     try
       // 1. Create the innermost part: {"text": "test"}
@@ -624,6 +736,7 @@ begin
     end;
     
   finally
+    MaxRetries:= SavedMaxRetries;
     FreeAndNil(BodyJSON); // BodyJSON owns all the child objects (Arrays, Parts, etc.), so freeing it frees everything.
   end;
 end;
