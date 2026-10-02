@@ -82,3 +82,6 @@ __recovery/
 modules/
 
 CLAUDE.md
+
+# Temporary files of Claude Code sessions
+Temp/
